@@ -30,6 +30,7 @@ from qfluentwidgets import FluentIcon as FIF
 
 from app import *
 from app.card.messagebox_custom import BaseInfoBar
+from app.mirror_stats_widget import MirrorStatsDialog, cache_charts
 from app.base_combination import (
     CheckBoxWithComboBox,
     LabelWithComboBox,
@@ -781,17 +782,19 @@ class PageMirror(PageCard):
         mediator.mirror_bar_kill_signal.connect(self.destroy_mirror_bar)
         mediator.mirror_stats_signal.connect(self._show_mirror_stats)
 
-    def _show_mirror_stats(self, summary: str):
-        """显示镜牢统计数据"""
-        BaseInfoBar.success(
-            title=self.tr("镜牢完成"),
-            content=summary,
-            orient=Qt.Orientation.Horizontal,
-            isClosable=True,
-            duration=8000,
-            position=InfoBarPosition.TOP,
-            parent=self,
-        )
+    def _show_mirror_stats(self, data: dict):
+        """显示统计结果（InfoBar + 可打开图表查看器）"""
+        filepath = data.get("excel", "")
+        chart_files = data.get("charts", [])
+        if filepath:
+            BaseInfoBar.success(
+                title=self.tr("镜牢统计已导出"),
+                content=self.tr("统计报告: ") + os.path.basename(filepath),
+                orient=Qt.Orientation.Horizontal, isClosable=True,
+                duration=5000, position=InfoBarPosition.TOP, parent=self,
+            )
+        if chart_files:
+            cache_charts(chart_files)
 
     def retranslateUi(self):
         self.mirror_count.retranslateUi()

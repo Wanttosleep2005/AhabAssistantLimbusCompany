@@ -510,6 +510,10 @@ class FarmingInterfaceLeft(QWidget):
         self.action_button_layout = QHBoxLayout()
         self.action_button_layout.addWidget(self.link_start_button)
         self.action_button_layout.addWidget(self.pause_resume_button)
+        self.stats_button = PushButton(FIF.INFO, QT_TRANSLATE_NOOP("PushButton", "查看统计"))
+        self.stats_button.clicked.connect(self._open_stats_dialog)
+        self.stats_button.setMinimumHeight(70)
+        self.action_button_layout.addWidget(self.stats_button)
         self.hbox_layout.addLayout(self.action_button_layout)
 
     @staticmethod
@@ -602,6 +606,30 @@ class FarmingInterfaceLeft(QWidget):
         if cfg.daily_task is False and cfg.get_reward is False and cfg.buy_enkephalin is False and cfg.mirror is False:
             mediator.tasks_warning.emit()
             return False
+
+    def _open_stats_dialog(self):
+        """打开镜牢统计图表查看器（优先缓存，回退到历史文件）"""
+        from app.mirror_stats_widget import get_cached_charts, cache_charts, MirrorStatsDialog
+        from app.card.messagebox_custom import BaseInfoBar
+        from tasks.base.script_task_scheme import _load_mirror_records, generate_mirror_charts
+        charts = get_cached_charts()
+        if not charts:
+            # 尝试从历史文件加载并重新生成图表
+            records = _load_mirror_records()
+            if records:
+                charts = generate_mirror_charts(records)
+                if charts:
+                    cache_charts(charts)
+        if not charts:
+            BaseInfoBar.warning(
+                title=self.tr("暂无数据"),
+                content=self.tr("请先完成至少一次镜牢任务"),
+                orient=Qt.Orientation.Horizontal, isClosable=True,
+                duration=3000, position=InfoBarPosition.TOP, parent=self,
+            )
+            return
+        dlg = MirrorStatsDialog(self.window(), charts)
+        dlg.exec()
 
     def start_and_stop_tasks(self):
         # 设置按下启动与停止按钮时，其他模块的启用与停用

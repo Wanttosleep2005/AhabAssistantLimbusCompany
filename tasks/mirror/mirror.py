@@ -35,23 +35,6 @@ from utils.image_utils import ImageUtils
 from utils.path_manager import path_manager
 
 
-def _ocr_reward_item(auto, ocr, image_name, label) -> int | None:
-    """OCR 识别单个奖励数量（纽/经验卡等）"""
-    scale = cfg.set_win_size / 1440
-    for _ in range(3):
-        try:
-            if pos := auto.find_element(f"mirror/claim_reward/{image_name}.png", take_screenshot=True):
-                bbox = [pos[0] - 80 * scale, pos[1] - 35 * scale, pos[0] + 160 * scale, pos[1] + 35 * scale]
-                sc = ImageUtils.crop(np.array(auto.screenshot), bbox)
-                result = ocr.run(sc)
-                ocr_text = "".join([result.txts[i] for i in range(len(result.txts))]).lower()
-                if "x" in ocr_text:
-                    return int(ocr_text.split("x")[-1])
-        except Exception:
-            continue
-    return None
-
-
 # 输出时间统计
 def to_log_with_time(msg, elapsed_time):
     # 将总秒数转换为小时、分钟和秒
@@ -137,21 +120,23 @@ class Mirror:
         self.mirror_map = MirrorMap(hard_mode=self.hard_switch)
 
         self.pass_coins = None
-        self.threads = None
-        self.xp_cards = None
 
         self.bequest_from_the_previous_game = False
 
-    def _ocr_rewards(self):
-        """尝试 OCR 识别纽和经验卡数量"""
-        if self.threads is None:
-            self.threads = _ocr_reward_item(auto, ocr, "thread", "纽")
-        if self.xp_cards is None:
-            self.xp_cards = _ocr_reward_item(auto, ocr, "xp_card", "经验卡")
-        if self.threads:
-            log.info(f"本次镜牢领取{self.threads}个纽")
-        if self.xp_cards:
-            log.info(f"本次镜牢领取{self.xp_cards}张经验卡")
+    def get_run_stats(self) -> dict:
+        """获取本次镜牢运行统计数据"""
+        return {
+            "team": self.team_number,
+            "hard": self.hard_switch,
+            "floor": self.floor,
+            "pass_coins": self.pass_coins or 0,
+            "battle_time": self.battle_total_time,
+            "event_time": self.event_total_time,
+            "event_count": self.event_times,
+            "shop_time": self.shop_total_time,
+            "find_road_time": self.find_road_total_time,
+            "elapsed": time.time() - self.start_time if self.start_time else 0,
+        }
 
     def road_to_mir(self):
         loop_count = 30
@@ -644,8 +629,6 @@ class Mirror:
                     else:
                         msg = "无法识别通行证经验数量，可能是UI发生变化"
                         log.warning(msg)
-                    # OCR 识别纽和经验卡数量
-                    self._ocr_rewards()
                     if auto.click_element(
                         "mirror/claim_reward/use_enkephalin_assets.png",
                         take_screenshot=True,

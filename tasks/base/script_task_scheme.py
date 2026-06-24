@@ -1,6 +1,7 @@
 import platform
 import random
 from datetime import datetime
+from pathlib import Path
 from time import sleep, time
 
 from playsound3 import playsound
@@ -43,6 +44,59 @@ from tasks.teams.team_formation import select_battle_team
 from utils.path_manager import path_manager
 from utils.utils import calculate_the_teams, check_hard_mirror_time, get_day_of_week
 
+# onetime_mir_process 被 @begin_and_finish_time_log 装饰器包裹，
+# 装饰器会丢弃函数返回值。因此通过此变量传出统计数据。
+_last_mirror_stats: dict = {}
+# 持久化每轮镜牢记录
+_MIRROR_RECORDS_PATH = Path("./logs/mirror_records.json")
+
+
+def _load_mirror_records() -> list[dict]:
+    """从持久化文件加载镜牢历史记录"""
+    if _MIRROR_RECORDS_PATH.exists():
+        try:
+            import json
+            with open(_MIRROR_RECORDS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def _save_mirror_records(new_records: list[dict]):
+    """合并保存镜牢记录到持久化文件（加载已有 + 追加新记录）"""
+    try:
+        import json
+        # 加载已有记录
+        existing = _load_mirror_records()
+        # 追加新记录（去重：同 timestamp + team_name 视为重复）
+        existing_ts = {(r.get("timestamp", ""), r.get("team_name", "")) for r in existing}
+        for rec in new_records:
+            slim = {
+                "timestamp": rec.get("timestamp", ""),
+                "team_name": rec.get("team_name", ""),
+                "team": rec.get("team", 0),
+                "hard": rec.get("hard", False),
+                "floor": rec.get("floor", 0),
+                "pass_coins": rec.get("pass_coins", 0),
+                "elapsed": round(rec.get("elapsed", 0)),
+                "battle_time": round(rec.get("battle_time", 0)),
+                "event_time": round(rec.get("event_time", 0)),
+                "event_count": rec.get("event_count", 0),
+                "shop_time": round(rec.get("shop_time", 0)),
+                "find_road_time": round(rec.get("find_road_time", 0)),
+            }
+            key = (slim["timestamp"], slim["team_name"])
+            if key not in existing_ts:
+                existing.append(slim)
+                existing_ts.add(key)
+        _MIRROR_RECORDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_MIRROR_RECORDS_PATH, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        log.debug(f"已保存 {len(existing)} 条镜牢记录到 {_MIRROR_RECORDS_PATH}")
+    except Exception as e:
+        log.warning(f"保存镜牢记录失败: {e}")
+
 
 @begin_and_finish_time_log(task_name="一次经验本")
 # 一次经验本的过程
@@ -79,6 +133,9 @@ def onetime_thread_process(combat_count: int = 1):
 @begin_and_finish_time_log(task_name="一次镜牢")
 # 一次镜牢的过程
 def onetime_mir_process(team_setting: TeamSetting, team_num: int):
+    """返回 True/False 表示是否成功。完成后通过 onetime_mir_process.last_mirror_stats 获取统计数据"""
+    global _last_mirror_stats
+    _last_mirror_stats = {}
     # 实时检查是否需要切换到困难镜牢
     if cfg.auto_hard_mirror and check_hard_mirror_time():
         log.info("检测到新的困牢周期，实时切换困难镜牢，设置困牢次数为3")
@@ -90,22 +147,18 @@ def onetime_mir_process(team_setting: TeamSetting, team_num: int):
     try:
         mirror_adventure = Mirror(team_setting, team_num)
         result = mirror_adventure.run()
-        stats = {
-            "pass_coins": mirror_adventure.pass_coins or 0,
-            "threads": mirror_adventure.threads or 0,
-            "xp_cards": mirror_adventure.xp_cards or 0,
-        }
+        _last_mirror_stats = mirror_adventure.get_run_stats()
         del mirror_adventure
         mirror_adventure = None
         if result:
             back_init_menu()
             make_enkephalin_module()
-            return True, stats
+            return True
         else:
-            return False, stats
+            return False
     except Exception as e:
         log.exception(f"镜牢行动出错: {e}")
-        return False, {"pass_coins": 0, "threads": 0, "xp_cards": 0}
+        return False
 
 
 def to_get_reward():
@@ -265,6 +318,38 @@ def Buy_enkephalin():
     lunacy_to_enkephalin(times=times)
 
 
+def _save_mirror_records(records: list[dict]) -> None:
+    """将本轮 run_records 追加保存到 logs/mirror_history.json（持久化）"""
+    import json
+    history_path = Path("./logs/mirror_history.json")
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: list[dict] = []
+    if history_path.exists():
+        try:
+            existing = json.loads(history_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, list):
+                existing = []
+        except Exception:
+            existing = []
+    existing.extend(records)
+    history_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_mirror_records() -> list[dict]:
+    """从 logs/mirror_history.json 加载历史镜牢记录"""
+    import json
+    history_path = Path("./logs/mirror_history.json")
+    if not history_path.exists():
+        return []
+    try:
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+
 def Mirror_task():
     # 判断执行镜牢任务的次数
     mir_times = cfg.set_mirror_count
@@ -273,7 +358,7 @@ def Mirror_task():
     if cfg.save_rewards and cfg.hard_mirror:
         mir_times = 1
     finish_times = 0
-    mirror_stats = {"pass_coins": 0, "threads": 0, "xp_cards": 0, "times": 0}
+    run_records = []  # 收集每次镜牢的详细数据
     mediator.mirror_signal.emit(0, mir_times)
     cfg.normalize_and_sync_team_state(persist=False)
     # 开始执行镜牢任务
@@ -309,11 +394,12 @@ def Mirror_task():
                 cfg.rotate_team_queue()
                 continue
         # 执行一次镜牢任务，根据执行结果进行处理
-        mirror_result, stats = onetime_mir_process(team_setting, team_num)
-        mirror_stats["pass_coins"] += stats["pass_coins"]
-        mirror_stats["threads"] += stats["threads"]
-        mirror_stats["xp_cards"] += stats["xp_cards"]
-        mirror_stats["times"] += 1
+        mirror_result = onetime_mir_process(team_setting, team_num)
+        stats = _last_mirror_stats
+        if stats:
+            stats["timestamp"] = datetime.now().isoformat(timespec="seconds")
+            stats["team_name"] = team_setting.remark_name or f"队伍{team_num}"
+            run_records.append(stats)
         if mirror_result:
             cfg.rotate_team_queue()
             mir_times -= 1
@@ -331,21 +417,487 @@ def Mirror_task():
             if finish_times == 1 and cfg.re_claim_rewards:  # 完成第一次镜牢后重新领取奖励
                 to_get_reward()
 
-    if mirror_stats["times"] > 0:
-        summary_parts = [f"镜牢统计: 共{mirror_stats['times']}次"]
-        if mirror_stats["pass_coins"]:
-            summary_parts.append(f"通行证经验x{mirror_stats['pass_coins']}")
-        if mirror_stats["threads"]:
-            summary_parts.append(f"纽x{mirror_stats['threads']}")
-        if mirror_stats["xp_cards"]:
-            summary_parts.append(f"经验卡x{mirror_stats['xp_cards']}")
-        summary = "  ".join(summary_parts)
-        log.info(summary)
-        mediator.mirror_stats_signal.emit(summary)
+    if run_records:
+        log.info(f"开始生成镜牢统计，共 {len(run_records)} 条记录")
+        filepath = None
+        chart_files: list[str] = []
+        try:
+            filepath = generate_mirror_stats_excel(run_records)
+            log.debug("Excel 统计报告生成完毕")
+        except Exception:
+            log.exception("生成 Excel 统计报告失败，继续生成图表")
+        try:
+            chart_files = generate_mirror_charts(run_records)
+            log.debug(f"图表生成完毕，共 {len(chart_files)} 张")
+        except Exception:
+            log.exception("生成图表失败")
+        _save_mirror_records(run_records)
+        data = {"excel": filepath or "", "charts": chart_files}
+        log.info(f"镜牢统计已导出: {filepath}")
+        mediator.mirror_stats_signal.emit(data)
 
     mediator.mirror_bar_kill_signal.emit()
     if cfg.re_claim_rewards and finish_times > 0:
         to_get_reward()
+
+
+def _blue_header(ws, row, col, value):
+    """写入蓝底白字表头"""
+    from openpyxl.styles import Font, PatternFill
+    c = ws.cell(row=row, column=col, value=value)
+    c.font = Font(bold=True, color="FFFFFF")
+    c.fill = PatternFill("solid", fgColor="4472C4")
+    return c
+
+
+def _fmt_seconds(sec: float) -> str:
+    """格式化秒数为 分:秒"""
+    return f"{int(sec // 60)}分{int(sec % 60)}秒"
+
+
+def _has_multi_teams(records: list[dict]) -> bool:
+    """是否有 ≥2 支不同队伍"""
+    teams = {r.get("team") for r in records}
+    return len(teams) >= 2
+
+
+def _has_both_difficulties(records: list[dict]) -> bool:
+    """是否同时跑了困难和普通"""
+    modes = {r.get("hard") for r in records}
+    return True in modes and False in modes
+
+
+def _build_team_sheet(wb, records: list[dict]):
+    """构建队伍对比 Sheet，返回 worksheet 或 None"""
+    if not _has_multi_teams(records):
+        return None
+
+    from openpyxl.styles import Font, PatternFill
+    from collections import defaultdict
+    groups: dict[int, dict] = defaultdict(lambda: {"times": 0, "elapsed": [], "pass_coins": []})
+    for r in records:
+        t = r.get("team", 0)
+        groups[t]["times"] += 1
+        groups[t]["elapsed"].append(r.get("elapsed", 0))
+        groups[t]["pass_coins"].append(r.get("pass_coins", 0))
+        groups[t]["name"] = r.get("team_name", f"队伍{t}")
+
+    ws = wb.create_sheet("队伍对比")
+    headers = ["队伍名称", "次数", "平均耗时(秒)", "总通行证经验", "平均耗时", "平均经验/次"]
+    for col, h in enumerate(headers, 1):
+        _blue_header(ws, 1, col, h)
+
+    row = 2
+    for team_id in sorted(groups):
+        g = groups[team_id]
+        avg_t = sum(g["elapsed"]) / g["times"]
+        avg_p = sum(g["pass_coins"]) / g["times"]
+        ws.cell(row=row, column=1, value=g["name"])
+        ws.cell(row=row, column=2, value=g["times"])
+        ws.cell(row=row, column=3, value=round(avg_t))
+        ws.cell(row=row, column=4, value=sum(g["pass_coins"]))
+        ws.cell(row=row, column=5, value=_fmt_seconds(avg_t))
+        ws.cell(row=row, column=6, value=round(avg_p))
+        row += 1
+
+    for col in range(1, len(headers) + 1):
+        from openpyxl.utils import get_column_letter
+        ws.column_dimensions[get_column_letter(col)].width = 16
+
+    # 队伍对比柱状图
+    if len(groups) >= 2:
+        from openpyxl.chart import BarChart, Reference
+        chart = BarChart()
+        chart.title = "队伍平均耗时对比"
+        chart.style = 10
+        chart.width = 20; chart.height = 12
+        data = Reference(ws, min_col=3, max_col=3, min_row=1, max_row=len(groups) + 1)
+        cats = Reference(ws, min_col=1, min_row=2, max_row=len(groups) + 1)
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        ws.add_chart(chart, f"A{row + 2}")
+
+    return ws
+
+
+def generate_mirror_stats_excel(run_records: list[dict]) -> str | None:
+    """生成镜牢统计 Excel 报告（含自动裁剪的图表）"""
+    try:
+        import openpyxl
+        from openpyxl.chart import (
+            AreaChart, BarChart, LineChart, PieChart, RadarChart,
+            ScatterChart, Reference, series,
+        )
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        log.warning("openpyxl 未安装，无法生成 Excel，请运行: pip install openpyxl")
+        return None
+
+    output_dir = Path("./logs")
+    output_dir.mkdir(exist_ok=True)
+    filename = f"mirror_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    filepath = str(output_dir / filename)
+
+    wb = openpyxl.Workbook()
+    n = len(run_records)
+    total_coins = sum(r.get("pass_coins", 0) for r in run_records)
+    total_time = sum(r.get("elapsed", 0) for r in run_records)
+
+    # ============================
+    # Sheet 1: 摘要
+    # ============================
+    ws1 = wb.active
+    ws1.title = "摘要"
+    ws1.merge_cells("A1:D1")
+    c = ws1["A1"]; c.value = "镜牢运行统计报告"; c.font = Font(bold=True, size=14)
+    c.alignment = Alignment(horizontal="center")
+    ws1["A2"].value = f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    ws1["A2"].font = Font(color="666666")
+
+    for col, h in enumerate(["指标", "数值"], 1):
+        _blue_header(ws1, 4, col, h)
+
+    hard_n = sum(1 for r in run_records if r.get("hard"))
+    summary = [
+        ("镜牢次数", n), ("困难镜牢", f"{hard_n} 次"), ("普通镜牢", f"{n - hard_n} 次"),
+        ("总通行证经验", total_coins), ("总耗时", _fmt_seconds(total_time)),
+        ("平均每轮耗时", _fmt_seconds(total_time / n) if n else "-"),
+        ("总事件次数", sum(r.get("event_count", 0) for r in run_records)),
+        ("通行证经验/分钟", round(total_coins / (total_time / 60), 1) if total_time else "-"),
+    ]
+    for i, (k, v) in enumerate(summary, 5):
+        ws1.cell(row=i, column=1, value=k); ws1.cell(row=i, column=2, value=v)
+    ws1.column_dimensions["A"].width = 20; ws1.column_dimensions["B"].width = 20
+
+    # ============================
+    # Sheet 2: 详细记录
+    # ============================
+    ws2 = wb.create_sheet("详细记录")
+    headers = ["序号", "时间", "队伍", "难度", "楼层", "通行证经验", "耗时(秒)", "战斗时间", "事件次数", "商店时间", "寻路时间"]
+    for col, h in enumerate(headers, 1):
+        _blue_header(ws2, 1, col, h)
+
+    for i, rec in enumerate(run_records, 2):
+        ws2.cell(row=i, column=1, value=i - 1)
+        ws2.cell(row=i, column=2, value=rec.get("timestamp", ""))
+        ws2.cell(row=i, column=3, value=rec.get("team_name", ""))
+        ws2.cell(row=i, column=4, value="困难" if rec.get("hard") else "普通")
+        ws2.cell(row=i, column=5, value=rec.get("floor", 0))
+        ws2.cell(row=i, column=6, value=rec.get("pass_coins", 0))
+        ws2.cell(row=i, column=7, value=round(rec.get("elapsed", 0)))
+        ws2.cell(row=i, column=8, value=round(rec.get("battle_time", 0)))
+        ws2.cell(row=i, column=9, value=rec.get("event_count", 0))
+        ws2.cell(row=i, column=10, value=round(rec.get("shop_time", 0)))
+        ws2.cell(row=i, column=11, value=round(rec.get("find_road_time", 0)))
+    for col in range(1, len(headers) + 1):
+        ws2.column_dimensions[get_column_letter(col)].width = 14 if col > 1 else 6
+
+    # ============================
+    # Sheet 3: 图表
+    # ============================
+    ws3 = wb.create_sheet("图表")
+    chart_row = 1
+
+    def _add_chart(chart, title=""):
+        nonlocal chart_row
+        chart.title = title or chart.title
+        chart.style = 10
+        chart.width = 20; chart.height = 12
+        ws3.add_chart(chart, f"A{chart_row}")
+        chart_row += 18
+
+    # 1. 每次耗时柱状图 (≥2次)
+    if n >= 2:
+        bc = BarChart()
+        bc.title = "每次镜牢耗时 (秒)"
+        bc.y_axis.title = "秒"
+        bc.add_data(Reference(ws2, min_col=7, min_row=1, max_row=n + 1), titles_from_data=True)
+        bc.set_categories(Reference(ws2, min_col=1, min_row=2, max_row=n + 1))
+        _add_chart(bc)
+
+    # 2. 通行证经验累计折线图 (≥2次)
+    if n >= 2:
+        # 在 ws2 末尾追加累计列
+        cum_col = len(headers) + 1
+        ws2.cell(row=1, column=cum_col, value="累计通行证经验")
+        cum = 0
+        for i, rec in enumerate(run_records, 2):
+            cum += rec.get("pass_coins", 0)
+            ws2.cell(row=i, column=cum_col, value=cum)
+
+        lc = LineChart()
+        lc.title = "通行证经验累计趋势"
+        lc.y_axis.title = "累计通行证经验"
+        lc.add_data(Reference(ws2, min_col=cum_col, min_row=1, max_row=n + 1), titles_from_data=True)
+        lc.set_categories(Reference(ws2, min_col=1, min_row=2, max_row=n + 1))
+        _add_chart(lc)
+
+    # 3. 时间分布饼图
+    battle_sum = sum(r.get("battle_time", 0) for r in run_records)
+    event_sum = sum(r.get("event_time", 0) for r in run_records)
+    shop_sum = sum(r.get("shop_time", 0) for r in run_records)
+    road_sum = sum(r.get("find_road_time", 0) for r in run_records)
+    if any([battle_sum, event_sum, shop_sum, road_sum]):
+        pie = PieChart()
+        pie.title = "时间分布占比"
+        # 写入临时数据到 ws3
+        pie_labels = ["战斗", "事件", "商店", "寻路"]
+        pie_values = [battle_sum, event_sum, shop_sum, road_sum]
+        for i, (lb, vl) in enumerate(zip(pie_labels, pie_values), 1):
+            ws3.cell(row=chart_row + 1, column=1, value=lb)
+            ws3.cell(row=chart_row + 1, column=2, value=round(vl))
+            chart_row += 1  # 临时移动
+        chart_row -= 4
+        pie.add_data(Reference(ws3, min_col=2, min_row=chart_row + 1, max_row=chart_row + 4))
+        pie.set_categories(Reference(ws3, min_col=1, min_row=chart_row + 1, max_row=chart_row + 4))
+        pie.width = 20; pie.height = 12; pie.style = 10
+        ws3.add_chart(pie, f"A{chart_row + 6}")
+        chart_row += 22
+
+    # 4. 累计耗时面积图 (≥2次)
+    if n >= 2:
+        cum_col2 = len(headers) + 2
+        ws2.cell(row=1, column=cum_col2, value="累计耗时(秒)")
+        cum_t = 0
+        for i, rec in enumerate(run_records, 2):
+            cum_t += rec.get("elapsed", 0)
+            ws2.cell(row=i, column=cum_col2, value=round(cum_t))
+
+        ac = AreaChart()
+        ac.title = "累计耗时增长"
+        ac.add_data(Reference(ws2, min_col=cum_col2, min_row=1, max_row=n + 1), titles_from_data=True)
+        ac.set_categories(Reference(ws2, min_col=1, min_row=2, max_row=n + 1))
+        _add_chart(ac)
+
+    # 5. 散点图：耗时 vs 通行证经验 (≥2次)
+    if n >= 2:
+        # 临时数据列
+        sc_col = len(headers) + 3
+        ws2.cell(row=1, column=sc_col, value="散点_耗时")
+        sc_col2 = len(headers) + 4
+        ws2.cell(row=1, column=sc_col2, value="散点_经验")
+        for i, rec in enumerate(run_records, 2):
+            ws2.cell(row=i, column=sc_col, value=round(rec.get("elapsed", 0)))
+            ws2.cell(row=i, column=sc_col2, value=rec.get("pass_coins", 0))
+
+        sc = ScatterChart()
+        sc.title = "耗时 vs 通行证经验"
+        sc.x_axis.title = "耗时(秒)"; sc.y_axis.title = "通行证经验"
+        sc.add_data(Reference(ws2, min_col=sc_col2, min_row=1, max_row=n + 1), titles_from_data=True)
+        sc.set_categories(Reference(ws2, min_col=sc_col, min_row=1, max_row=n + 1))
+        _add_chart(sc)
+
+    # 6. 雷达图：综合评分 (≥3次)
+    if n >= 3:
+        avg_elapsed = total_time / n
+        avg_coins = total_coins / n
+        avg_events = sum(r.get("event_count", 0) for r in run_records) / n
+        avg_floor = sum(r.get("floor", 0) for r in run_records) / n
+
+        # 标准化到 0-100（反向指标如耗时越低越好）
+        max_e = max(r.get("elapsed", 1) for r in run_records)
+        max_p = max(1, max(r.get("pass_coins", 1) for r in run_records))
+
+        # 写入雷达数据
+        cat_row = chart_row
+        val_row = chart_row + 1
+        categories = ["速度得分", "收益得分", "事件得分", "楼层得分"]
+        scores = [
+            round((1 - avg_elapsed / max_e) * 100),  # 速度（耗时越短越高）
+            round(avg_coins / max_p * 100),            # 收益
+            round(min(avg_events / 15 * 100, 100)),    # 事件
+            round(avg_floor / 5 * 100),                 # 楼层
+        ]
+        ws3.cell(row=cat_row, column=1, value="维度")
+        ws3.cell(row=val_row, column=1, value="综合评分")
+        for j, (cat, score) in enumerate(zip(categories, scores), 2):
+            ws3.cell(row=cat_row, column=j, value=cat)
+            ws3.cell(row=val_row, column=j, value=score)
+
+        rc = RadarChart()
+        rc.title = "镜牢综合评分"
+        rc.add_data(Reference(ws3, min_col=1, max_col=len(categories) + 1, min_row=val_row, max_row=val_row))
+        rc.set_categories(Reference(ws3, min_col=2, max_col=len(categories) + 1, min_row=cat_row, max_row=cat_row))
+        rc.width = 20; rc.height = 12; rc.style = 10
+        ws3.add_chart(rc, f"A{val_row + 3}")
+        chart_row = val_row + 19
+
+    # ============================
+    # 多队伍图表
+    # ============================
+    _build_team_sheet(wb, run_records)
+
+    # ============================
+    # 困难 vs 普通图表
+    # ============================
+    if _has_both_difficulties(run_records):
+        ws_d = wb.create_sheet("难度对比")
+        _blue_header(ws_d, 1, 1, "难度"); _blue_header(ws_d, 1, 2, "次数"); _blue_header(ws_d, 1, 3, "平均耗时(秒)")
+        _blue_header(ws_d, 1, 4, "平均通行证经验")
+
+        for mode_label, mode_flag in [("困难", True), ("普通", False)]:
+            subset = [r for r in run_records if r.get("hard") == mode_flag]
+            if not subset:
+                continue
+            cnt = len(subset)
+            avg_t = sum(r.get("elapsed", 0) for r in subset) / cnt
+            avg_p = sum(r.get("pass_coins", 0) for r in subset) / cnt
+            row = 2 if mode_flag else 3
+            ws_d.cell(row=row, column=1, value=mode_label)
+            ws_d.cell(row=row, column=2, value=cnt)
+            ws_d.cell(row=row, column=3, value=round(avg_t))
+            ws_d.cell(row=row, column=4, value=round(avg_p))
+
+        for col in range(1, 5):
+            ws_d.column_dimensions[get_column_letter(col)].width = 18
+
+        # 对比柱状图
+        bc2 = BarChart()
+        bc2.title = "困难 vs 普通 平均耗时(秒)"
+        bc2.style = 10; bc2.width = 20; bc2.height = 12
+        bc2.add_data(Reference(ws_d, min_col=3, max_col=3, min_row=1, max_row=3), titles_from_data=True)
+        bc2.set_categories(Reference(ws_d, min_col=1, min_row=2, max_row=3))
+        ws_d.add_chart(bc2, "A6")
+
+        bc3 = BarChart()
+        bc3.title = "困难 vs 普通 平均通行证经验"
+        bc3.style = 10; bc3.width = 20; bc3.height = 12
+        bc3.add_data(Reference(ws_d, min_col=4, max_col=4, min_row=1, max_row=3), titles_from_data=True)
+        bc3.set_categories(Reference(ws_d, min_col=1, min_row=2, max_row=3))
+        ws_d.add_chart(bc3, "A24")
+
+    # ============================
+    # 保存
+    # ============================
+    wb.save(filepath)
+    return filepath
+
+
+def _format_mmss(seconds: float) -> str:
+    """秒数格式化为 mm:ss"""
+    m, s = divmod(int(seconds), 60)
+    return f"{m}:{s:02d}"
+
+
+def generate_mirror_charts(run_records: list[dict]) -> list[str]:
+    """生成镜牢统计 PNG 图表，返回文件路径列表"""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log.warning("matplotlib 未安装，无法生成图表")
+        return []
+
+    # 中文字体回退
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+    output_dir = Path("./logs/charts")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    chart_files = []
+    n = len(run_records)
+    if n == 0:
+        return []
+
+    # 颜色
+    blue = "#4472C4"
+    colors = ["#4472C4", "#ED7D31", "#A5A5A5", "#FFC000", "#5B9BD5", "#70AD47"]
+
+    # ---- 1. 每次耗时柱状图 ----
+    fig, ax = plt.subplots(figsize=(10, 5))
+    x = list(range(1, n + 1))
+    elapsed = [r.get("elapsed", 0) for r in run_records]
+    bars = ax.bar(x, elapsed, color=blue, edgecolor="white")
+    for bar, val in zip(bars, elapsed):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 15,
+                _format_mmss(val), ha="center", fontsize=8)
+    ax.set_title("每次镜牢耗时", fontsize=14, fontweight="bold")
+    ax.set_xlabel("镜牢序号"); ax.set_ylabel("耗时 (秒)")
+    ax.set_xticks(x)
+    fp = str(output_dir / "chart_1_elapsed.png")
+    fig.tight_layout(); fig.savefig(fp, dpi=120); plt.close(fig)
+    chart_files.append(fp)
+
+    # ---- 2. 通行证经验累计折线图 ----
+    fig, ax = plt.subplots(figsize=(10, 5))
+    cumulative = []
+    acc = 0
+    for r in run_records:
+        acc += r.get("pass_coins", 0)
+        cumulative.append(acc)
+    ax.plot(x, cumulative, "o-", color=colors[1], linewidth=2, markersize=6)
+    ax.fill_between(x, 0, cumulative, alpha=0.1, color=colors[1])
+    for i, v in enumerate(cumulative, 1):
+        ax.text(i, v + max(cumulative) * 0.02, str(v), ha="center", fontsize=9)
+    ax.set_title("通行证经验累计趋势", fontsize=14, fontweight="bold")
+    ax.set_xlabel("镜牢序号"); ax.set_ylabel("累计通行证经验")
+    ax.set_xticks(x)
+    fp = str(output_dir / "chart_2_coins.png")
+    fig.tight_layout(); fig.savefig(fp, dpi=120); plt.close(fig)
+    chart_files.append(fp)
+
+    # ---- 3. 时间分布饼图 ----
+    battle_sum = sum(r.get("battle_time", 0) for r in run_records)
+    event_sum = sum(r.get("event_time", 0) for r in run_records)
+    shop_sum = sum(r.get("shop_time", 0) for r in run_records)
+    road_sum = sum(r.get("find_road_time", 0) for r in run_records)
+    if any([battle_sum, event_sum, shop_sum, road_sum]):
+        fig, ax = plt.subplots(figsize=(7, 7))
+        labels = ["战斗", "事件", "商店", "寻路"]
+        sizes = [battle_sum, event_sum, shop_sum, road_sum]
+        explode = (0.02, 0.02, 0.02, 0.02)
+        wedges, texts, autotexts = ax.pie(sizes, explode=explode, labels=labels,
+            colors=colors[:4], autopct="%1.1f%%", startangle=90)
+        for t in autotexts:
+            t.set_fontsize(11); t.set_fontweight("bold")
+        ax.set_title("时间分布占比", fontsize=14, fontweight="bold")
+        fp = str(output_dir / "chart_3_pie.png")
+        fig.tight_layout(); fig.savefig(fp, dpi=120); plt.close(fig)
+        chart_files.append(fp)
+
+    # ---- 4. 队伍对比（≥2队）----
+    teams_map: dict[str, list] = {}
+    for r in run_records:
+        tn = r.get("team_name", f"队伍{r.get('team')}")
+        teams_map.setdefault(tn, []).append(r.get("elapsed", 0))
+    if len(teams_map) >= 2:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        names = list(teams_map.keys())
+        avgs = [sum(v) / len(v) for v in teams_map.values()]
+        bars = ax.bar(range(len(names)), avgs, color=colors[:len(names)], edgecolor="white")
+        for bar, val in zip(bars, avgs):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 10,
+                    _format_mmss(val), ha="center", fontsize=10)
+        ax.set_title("队伍平均耗时对比", fontsize=14, fontweight="bold")
+        ax.set_ylabel("平均耗时 (秒)")
+        ax.set_xticks(range(len(names))); ax.set_xticklabels(names)
+        fp = str(output_dir / "chart_4_teams.png")
+        fig.tight_layout(); fig.savefig(fp, dpi=120); plt.close(fig)
+        chart_files.append(fp)
+
+    # ---- 5. 困难 vs 普通 ----
+    hard_recs = [r for r in run_records if r.get("hard")]
+    normal_recs = [r for r in run_records if not r.get("hard")]
+    if hard_recs and normal_recs:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        h_avg_time = sum(r["elapsed"] for r in hard_recs) / len(hard_recs)
+        n_avg_time = sum(r["elapsed"] for r in normal_recs) / len(normal_recs)
+        ax1.bar(["困难", "普通"], [h_avg_time, n_avg_time], color=[colors[1], colors[0]], edgecolor="white")
+        ax1.set_title("平均耗时对比", fontweight="bold")
+        ax1.set_ylabel("秒")
+        h_avg_coins = sum(r["pass_coins"] for r in hard_recs) / len(hard_recs)
+        n_avg_coins = sum(r["pass_coins"] for r in normal_recs) / len(normal_recs)
+        ax2.bar(["困难", "普通"], [h_avg_coins, n_avg_coins], color=[colors[1], colors[0]], edgecolor="white")
+        ax2.set_title("平均通行证经验对比", fontweight="bold")
+        ax2.set_ylabel("经验")
+        fig.suptitle("困难 vs 普通镜牢", fontsize=14, fontweight="bold")
+        fp = str(output_dir / "chart_5_difficulty.png")
+        fig.tight_layout(); fig.savefig(fp, dpi=120); plt.close(fig)
+        chart_files.append(fp)
+
+    return chart_files
 
 
 def script_task() -> None | int:
