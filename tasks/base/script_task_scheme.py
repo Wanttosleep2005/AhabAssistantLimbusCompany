@@ -49,15 +49,77 @@ from utils.utils import calculate_the_teams, check_hard_mirror_time, get_day_of_
 _last_mirror_stats: dict = {}
 # 持久化每轮镜牢记录
 _MIRROR_RECORDS_PATH = Path("./logs/mirror_records.json")
+_CLEANUP_KEY = "__cleanup_ts"
+
+
+def _should_cleanup() -> bool:
+    """检查是否需要周四清理（副本重置日）"""
+    now = datetime.now()
+    if now.weekday() != 3:  # 0=周一, 3=周四
+        return False
+    # 检查上次清理是否在本周四之前
+    try:
+        import json
+        if _MIRROR_RECORDS_PATH.exists():
+            data = json.loads(_MIRROR_RECORDS_PATH.read_text(encoding="utf-8"))
+            meta = data[-1] if isinstance(data, list) and data and isinstance(data[-1], dict) else {}
+            last_cleanup = meta.get(_CLEANUP_KEY, "")
+            if last_cleanup:
+                last_dt = datetime.fromisoformat(last_cleanup)
+                return last_dt.date() < now.date()
+    except Exception:
+        pass
+    return True  # 首次运行，执行清理
+
+
+def _save_cleanup_mark():
+    """在记录末尾追加清理标记（直接读写文件，避免递归）"""
+    try:
+        import json
+        existing = []
+        if _MIRROR_RECORDS_PATH.exists():
+            existing = json.loads(_MIRROR_RECORDS_PATH.read_text(encoding="utf-8"))
+            if not isinstance(existing, list):
+                existing = []
+        # 已在 _load_mirror_records 中过滤，只需追加标记
+        existing.append({_CLEANUP_KEY: datetime.now().isoformat(timespec="seconds")})
+        _MIRROR_RECORDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_MIRROR_RECORDS_PATH, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def _load_mirror_records() -> list[dict]:
-    """从持久化文件加载镜牢历史记录"""
+    """从持久化文件加载镜牢历史记录（周四自动清理）"""
+    import json
     if _MIRROR_RECORDS_PATH.exists():
         try:
-            import json
             with open(_MIRROR_RECORDS_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            if not isinstance(data, list):
+                return []
+            # 过滤掉清理标记，只返回有效记录
+            records = [r for r in data if _CLEANUP_KEY not in r]
+            # 周四清理逻辑
+            if _should_cleanup():
+                today = datetime.now().strftime("%Y-%m-%d")
+                log.info(f"周四镜牢数据自动清理: {today}, 清理前共 {len(records)} 条")
+                now = datetime.now()
+                records = [r for r in records
+                           if datetime.fromisoformat(r.get("timestamp", "2000-01-01")).date() >= now.date()]
+                # 同步清理 charts 目录
+                charts_dir = Path("./logs/charts")
+                if charts_dir.exists():
+                    for old_chart in charts_dir.glob("chart_*.png"):
+                        try:
+                            old_chart.unlink()
+                        except OSError:
+                            pass
+                    log.info("周四已清理 charts 目录")
+                _save_cleanup_mark()
+                log.info(f"清理完成，保留 {len(records)} 条（仅保留今日）")
+            return records
         except Exception:
             pass
     return []
@@ -414,6 +476,13 @@ def Mirror_task():
             mediator.mirror_signal.emit(finish_times, mir_times)
             msg = f"已完成 {finish_times} 次镜牢"
             log.info(msg)
+            # 每轮结束输出摘要日志（实时可看）
+            if stats:
+                diff_label = "困难" if stats.get("hard") else "普通"
+                summary = (f"  第{finish_times}轮 | {stats.get('team_name', '?')} | {diff_label} | "
+                           f"耗时{_format_mmss(stats.get('elapsed', 0))} | "
+                           f"{stats.get('pass_coins', 0)}经验 | {stats.get('floor', 0)}层")
+                log.info(summary)
             if finish_times == 1 and cfg.re_claim_rewards:  # 完成第一次镜牢后重新领取奖励
                 to_get_reward()
 
@@ -432,6 +501,14 @@ def Mirror_task():
         except Exception:
             log.exception("生成图表失败")
         _save_mirror_records(run_records)
+        # 用全量历史数据重新生成图表（包含之前累积的记录）
+        all_records = _load_mirror_records()
+        if len(all_records) > len(run_records):
+            try:
+                chart_files = generate_mirror_charts(all_records)
+                log.debug(f"基于全量 {len(all_records)} 条历史记录重新生成 {len(chart_files)} 张图表")
+            except Exception:
+                log.exception("生成全量图表失败")
         data = {"excel": filepath or "", "charts": chart_files}
         log.info(f"镜牢统计已导出: {filepath}")
         mediator.mirror_stats_signal.emit(data)
@@ -536,7 +613,7 @@ def generate_mirror_stats_excel(run_records: list[dict]) -> str | None:
 
     output_dir = Path("./logs")
     output_dir.mkdir(exist_ok=True)
-    filename = f"mirror_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    filename = "mirror_stats.xlsx"  # 固定文件名，每轮覆盖更新（全量快照）
     filepath = str(output_dir / filename)
 
     wb = openpyxl.Workbook()
@@ -796,6 +873,12 @@ def generate_mirror_charts(run_records: list[dict]) -> list[str]:
 
     output_dir = Path("./logs/charts")
     output_dir.mkdir(parents=True, exist_ok=True)
+    # 每次生成前清空旧图表（覆盖而非累积）
+    for old_chart in output_dir.glob("chart_*.png"):
+        try:
+            old_chart.unlink()
+        except OSError:
+            pass
     chart_files = []
     n = len(run_records)
     if n == 0:
@@ -805,37 +888,60 @@ def generate_mirror_charts(run_records: list[dict]) -> list[str]:
     blue = "#4472C4"
     colors = ["#4472C4", "#ED7D31", "#A5A5A5", "#FFC000", "#5B9BD5", "#70AD47"]
 
-    # ---- 1. 每次耗时柱状图 ----
-    fig, ax = plt.subplots(figsize=(10, 5))
-    x = list(range(1, n + 1))
+    # ---- 1. 每次耗时柱状图（X轴 = team_name）----
+    chart_w = max(6, min(12, n * 1.5))
+    fig, ax = plt.subplots(figsize=(chart_w, 7))
+    names = [r.get("team_name", f"#{i}") for i, r in enumerate(run_records, 1)]
+    max_name_len = 8 if n <= 2 else 12
+    names = [s if len(s) <= max_name_len else s[:max_name_len - 1] + "…" for s in names]
     elapsed = [r.get("elapsed", 0) for r in run_records]
-    bars = ax.bar(x, elapsed, color=blue, edgecolor="white")
+    x = list(range(len(names)))
+    bar_w = 0.4 if n == 1 else 0.6
+    bars = ax.bar(x, elapsed, width=bar_w, color=blue, edgecolor="white")
     for bar, val in zip(bars, elapsed):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 15,
-                _format_mmss(val), ha="center", fontsize=8)
-    ax.set_title("每次镜牢耗时", fontsize=14, fontweight="bold")
-    ax.set_xlabel("镜牢序号"); ax.set_ylabel("耗时 (秒)")
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(elapsed) * 0.02,
+                _format_mmss(val), ha="center", fontsize=9)
+    ax.set_title("每次镜牢耗时", fontsize=14, fontweight="bold", pad=20)
+    ax.set_xlabel("队伍", labelpad=12)
+    ax.set_ylabel("耗时 (秒)", labelpad=12)
     ax.set_xticks(x)
+    rot = 0 if n <= 2 else (15 if n <= 4 else 25)
+    ax.set_xticklabels(names, rotation=rot, ha="center", fontsize=10)
+    ax.set_xlim(-0.6, len(names) - 0.4)
     fp = str(output_dir / "chart_1_elapsed.png")
-    fig.tight_layout(); fig.savefig(fp, dpi=120); plt.close(fig)
+    fig.savefig(fp, dpi=120, bbox_inches="tight", pad_inches=0.6)
+    plt.close(fig)
     chart_files.append(fp)
 
-    # ---- 2. 通行证经验累计折线图 ----
-    fig, ax = plt.subplots(figsize=(10, 5))
+    # ---- 2. 通行证经验累计趋势图（Y轴从第一条经验起始）----
+    fig, ax = plt.subplots(figsize=(chart_w, 7))
     cumulative = []
     acc = 0
     for r in run_records:
         acc += r.get("pass_coins", 0)
         cumulative.append(acc)
-    ax.plot(x, cumulative, "o-", color=colors[1], linewidth=2, markersize=6)
-    ax.fill_between(x, 0, cumulative, alpha=0.1, color=colors[1])
-    for i, v in enumerate(cumulative, 1):
-        ax.text(i, v + max(cumulative) * 0.02, str(v), ha="center", fontsize=9)
-    ax.set_title("通行证经验累计趋势", fontsize=14, fontweight="bold")
-    ax.set_xlabel("镜牢序号"); ax.set_ylabel("累计通行证经验")
+    y_bottom = max(0, cumulative[0] * 0.85 if cumulative[0] > 0 else 0)
+    y_top = max(cumulative) * 1.18 if max(cumulative) > 0 else 100
+    ax.set_ylim(y_bottom, y_top)
+    ms = 12 if n <= 2 else 7
+    ax.plot(x, cumulative, "o-", color=colors[1], linewidth=2.5, markersize=ms,
+            markerfacecolor="white", markeredgewidth=2)
+    ax.fill_between(x, cumulative, alpha=0.15, color=colors[1])
+    increments = [cumulative[0]] + [cumulative[i] - cumulative[i - 1] for i in range(1, n)]
+    for i, inc in enumerate(increments):
+        mid_y = (cumulative[i] + (cumulative[i - 1] if i > 0 else y_bottom)) / 2
+        ax.annotate(f"+{inc}", (i, mid_y), ha="center", fontsize=8, color="#888", fontstyle="italic")
+    for i, v in enumerate(cumulative):
+        ax.text(i, v + (y_top - y_bottom) * 0.025, str(v), ha="center", fontsize=10, fontweight="bold")
+    ax.set_title("通行证经验累计趋势", fontsize=14, fontweight="bold", pad=20)
+    ax.set_xlabel("队伍", labelpad=12)
+    ax.set_ylabel("累计通行证经验", labelpad=12)
     ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=rot, ha="center", fontsize=10)
+    ax.set_xlim(-0.6, len(names) - 0.4)
     fp = str(output_dir / "chart_2_coins.png")
-    fig.tight_layout(); fig.savefig(fp, dpi=120); plt.close(fig)
+    fig.savefig(fp, dpi=120, bbox_inches="tight", pad_inches=0.6)
+    plt.close(fig)
     chart_files.append(fp)
 
     # ---- 3. 时间分布饼图 ----
@@ -844,58 +950,139 @@ def generate_mirror_charts(run_records: list[dict]) -> list[str]:
     shop_sum = sum(r.get("shop_time", 0) for r in run_records)
     road_sum = sum(r.get("find_road_time", 0) for r in run_records)
     if any([battle_sum, event_sum, shop_sum, road_sum]):
-        fig, ax = plt.subplots(figsize=(7, 7))
+        fig, ax = plt.subplots(figsize=(9, 9))
         labels = ["战斗", "事件", "商店", "寻路"]
         sizes = [battle_sum, event_sum, shop_sum, road_sum]
         explode = (0.02, 0.02, 0.02, 0.02)
         wedges, texts, autotexts = ax.pie(sizes, explode=explode, labels=labels,
-            colors=colors[:4], autopct="%1.1f%%", startangle=90)
+            colors=colors[:4], autopct="%1.1f%%", startangle=90,
+            textprops={"fontsize": 11})
         for t in autotexts:
-            t.set_fontsize(11); t.set_fontweight("bold")
-        ax.set_title("时间分布占比", fontsize=14, fontweight="bold")
+            t.set_fontsize(12)
+            t.set_fontweight("bold")
+        ax.set_title("时间分布占比", fontsize=14, fontweight="bold", pad=25)
         fp = str(output_dir / "chart_3_pie.png")
-        fig.tight_layout(); fig.savefig(fp, dpi=120); plt.close(fig)
+        fig.savefig(fp, dpi=120, bbox_inches="tight", pad_inches=0.6)
+        plt.close(fig)
         chart_files.append(fp)
 
     # ---- 4. 队伍对比（≥2队）----
     teams_map: dict[str, list] = {}
     for r in run_records:
         tn = r.get("team_name", f"队伍{r.get('team')}")
-        teams_map.setdefault(tn, []).append(r.get("elapsed", 0))
+        if tn not in teams_map:
+            teams_map[tn] = []
+        teams_map[tn].append(r.get("elapsed", 0))
     if len(teams_map) >= 2:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        names = list(teams_map.keys())
+        team_w = max(6, len(teams_map) * 1.6)
+        fig, ax = plt.subplots(figsize=(team_w, 7))
+        tnames = list(teams_map.keys())
+        tnames = [s if len(s) <= 8 else s[:7] + "…" for s in tnames]
         avgs = [sum(v) / len(v) for v in teams_map.values()]
-        bars = ax.bar(range(len(names)), avgs, color=colors[:len(names)], edgecolor="white")
+        bars = ax.bar(range(len(tnames)), avgs, width=0.45, color=colors[:len(tnames)], edgecolor="white")
         for bar, val in zip(bars, avgs):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 10,
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(avgs) * 0.02,
                     _format_mmss(val), ha="center", fontsize=10)
-        ax.set_title("队伍平均耗时对比", fontsize=14, fontweight="bold")
-        ax.set_ylabel("平均耗时 (秒)")
-        ax.set_xticks(range(len(names))); ax.set_xticklabels(names)
+        ax.set_title("队伍平均耗时对比", fontsize=14, fontweight="bold", pad=20)
+        ax.set_ylabel("平均耗时 (秒)", labelpad=12)
+        ax.set_xticks(range(len(tnames)))
+        rot4 = 0 if len(tnames) <= 3 else 15
+        ax.set_xticklabels(tnames, rotation=rot4, ha="center", fontsize=10)
         fp = str(output_dir / "chart_4_teams.png")
-        fig.tight_layout(); fig.savefig(fp, dpi=120); plt.close(fig)
+        fig.savefig(fp, dpi=120, bbox_inches="tight", pad_inches=0.6)
+        plt.close(fig)
         chart_files.append(fp)
 
     # ---- 5. 困难 vs 普通 ----
     hard_recs = [r for r in run_records if r.get("hard")]
     normal_recs = [r for r in run_records if not r.get("hard")]
     if hard_recs and normal_recs:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
         h_avg_time = sum(r["elapsed"] for r in hard_recs) / len(hard_recs)
         n_avg_time = sum(r["elapsed"] for r in normal_recs) / len(normal_recs)
         ax1.bar(["困难", "普通"], [h_avg_time, n_avg_time], color=[colors[1], colors[0]], edgecolor="white")
-        ax1.set_title("平均耗时对比", fontweight="bold")
-        ax1.set_ylabel("秒")
+        ax1.set_title("平均耗时对比", fontweight="bold", pad=15)
+        ax1.set_ylabel("秒", labelpad=10)
         h_avg_coins = sum(r["pass_coins"] for r in hard_recs) / len(hard_recs)
         n_avg_coins = sum(r["pass_coins"] for r in normal_recs) / len(normal_recs)
         ax2.bar(["困难", "普通"], [h_avg_coins, n_avg_coins], color=[colors[1], colors[0]], edgecolor="white")
-        ax2.set_title("平均通行证经验对比", fontweight="bold")
-        ax2.set_ylabel("经验")
+        ax2.set_title("平均通行证经验对比", fontweight="bold", pad=15)
+        ax2.set_ylabel("经验", labelpad=10)
         fig.suptitle("困难 vs 普通镜牢", fontsize=14, fontweight="bold")
+        fig.subplots_adjust(top=0.85)
         fp = str(output_dir / "chart_5_difficulty.png")
-        fig.tight_layout(); fig.savefig(fp, dpi=120); plt.close(fig)
+        fig.savefig(fp, dpi=120, bbox_inches="tight", pad_inches=0.6)
+        plt.close(fig)
         chart_files.append(fp)
+
+    # ---- 6. 耗时 vs 经验散点图（效率分布）----
+    if n >= 3:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        for r in run_records:
+            marker = "D" if r.get("hard") else "o"
+            c = colors[1] if r.get("hard") else blue
+            lb = r.get("team_name", "")[:6]
+            ax.scatter(r.get("elapsed", 0), r.get("pass_coins", 0),
+                       s=120, c=c, marker=marker, edgecolors="white", linewidth=0.8, zorder=5)
+            ax.annotate(lb, (r.get("elapsed", 0), r.get("pass_coins", 0)),
+                        textcoords="offset points", xytext=(8, 6), fontsize=8,
+                        fontweight="bold", color="#333")
+        ax.set_title("耗时 vs 通行证经验（效率分布）", fontsize=14, fontweight="bold", pad=20)
+        ax.set_xlabel("耗时 (秒)", labelpad=12)
+        ax.set_ylabel("通行证经验", labelpad=12)
+        ax.grid(True, alpha=0.3, linestyle="--")
+        fp = str(output_dir / "chart_6_scatter.png")
+        fig.savefig(fp, dpi=120, bbox_inches="tight", pad_inches=0.6)
+        plt.close(fig)
+        chart_files.append(fp)
+
+    # ---- 7. 每次用时构成堆叠柱状图（≥2次）----
+    if n >= 2:
+        fig, ax = plt.subplots(figsize=(chart_w, 7))
+        battle = [r.get("battle_time", 0) for r in run_records]
+        event_t = [r.get("event_time", 0) for r in run_records]
+        shop = [r.get("shop_time", 0) for r in run_records]
+        road = [r.get("find_road_time", 0) for r in run_records]
+        bar_w2 = 0.4 if n <= 3 else 0.6
+        ax.bar(x, battle, width=bar_w2, label="战斗", color=colors[0])
+        ax.bar(x, event_t, width=bar_w2, bottom=battle, label="事件", color=colors[1])
+        bottom2 = [a + b for a, b in zip(battle, event_t)]
+        ax.bar(x, shop, width=bar_w2, bottom=bottom2, label="商店", color=colors[2])
+        bottom3 = [a + b for a, b in zip(bottom2, shop)]
+        ax.bar(x, road, width=bar_w2, bottom=bottom3, label="寻路", color=colors[3])
+        ax.set_title("每次用时构成", fontsize=14, fontweight="bold", pad=20)
+        ax.set_xlabel("队伍", labelpad=12)
+        ax.set_ylabel("耗时 (秒)", labelpad=12)
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, rotation=rot, ha="center", fontsize=10)
+        ax.set_xlim(-0.6, len(names) - 0.4)
+        ax.legend(loc="upper right", fontsize=9)
+        fp = str(output_dir / "chart_7_stack.png")
+        fig.savefig(fp, dpi=120, bbox_inches="tight", pad_inches=0.6)
+        plt.close(fig)
+        chart_files.append(fp)
+
+    # ---- 8. 队伍耗时箱线图（≥2队，≥4次）----
+    if len(teams_map) >= 2 and n >= 4:
+        box_labels_all = list(teams_map.keys())
+        box_labels_all = [s if len(s) <= 8 else s[:7] + "…" for s in box_labels_all]
+        box_data = [vals for vals in teams_map.values() if len(vals) >= 2]
+        box_labels = [name for name, vals in zip(box_labels_all, teams_map.values()) if len(vals) >= 2]
+        if len(box_data) >= 2:
+            box_w = max(6, len(box_data) * 1.6)
+            fig, ax = plt.subplots(figsize=(box_w, 7))
+            bp = ax.boxplot(box_data, labels=box_labels, patch_artist=True,
+                            showmeans=True, meanprops={"marker": "D", "markerfacecolor": "red"})
+            for patch, c in zip(bp["boxes"], colors[:len(box_data)]):
+                patch.set_facecolor(c)
+                patch.set_alpha(0.6)
+            ax.set_title("队伍耗时分布（箱线图）", fontsize=14, fontweight="bold", pad=20)
+            ax.set_ylabel("耗时 (秒)", labelpad=12)
+            ax.tick_params(axis="x", rotation=15 if len(box_data) <= 4 else 25, labelsize=10)
+            fp = str(output_dir / "chart_8_boxplot.png")
+            fig.savefig(fp, dpi=120, bbox_inches="tight", pad_inches=0.6)
+            plt.close(fig)
+            chart_files.append(fp)
 
     return chart_files
 

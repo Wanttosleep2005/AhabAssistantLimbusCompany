@@ -609,17 +609,20 @@ class FarmingInterfaceLeft(QWidget):
 
     def _open_stats_dialog(self):
         """打开镜牢统计图表查看器（优先缓存，回退到历史文件）"""
-        from app.mirror_stats_widget import get_cached_charts, cache_charts, MirrorStatsDialog
+        from app.mirror_stats_widget import (get_cached_charts, get_cached_records,
+                                              cache_charts, MirrorStatsDialog)
         from app.card.messagebox_custom import BaseInfoBar
         from tasks.base.script_task_scheme import _load_mirror_records, generate_mirror_charts
         charts = get_cached_charts()
+        all_records = get_cached_records()
         if not charts:
             # 尝试从历史文件加载并重新生成图表
-            records = _load_mirror_records()
-            if records:
-                charts = generate_mirror_charts(records)
+            if not all_records:
+                all_records = _load_mirror_records()
+            if all_records:
+                charts = generate_mirror_charts(all_records)
                 if charts:
-                    cache_charts(charts)
+                    cache_charts(charts, all_records)
         if not charts:
             BaseInfoBar.warning(
                 title=self.tr("暂无数据"),
@@ -628,7 +631,7 @@ class FarmingInterfaceLeft(QWidget):
                 duration=3000, position=InfoBarPosition.TOP, parent=self,
             )
             return
-        dlg = MirrorStatsDialog(self.window(), charts)
+        dlg = MirrorStatsDialog(self.window(), charts, all_records if all_records else None)
         dlg.exec()
 
     def start_and_stop_tasks(self):

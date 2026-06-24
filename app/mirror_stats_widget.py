@@ -1,11 +1,12 @@
 """镜牢统计可视化组件 —— 在应用内查看图表"""
 import os
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
-from qfluentwidgets import ScrollArea, SubtitleLabel, TitleLabel, isDarkTheme
+from qfluentwidgets import CheckBox, ScrollArea, SubtitleLabel, TitleLabel, isDarkTheme
 from qfluentwidgets import FluentIcon as FIF
 from qframelesswindow import FramelessDialog, StandardTitleBar
 
@@ -13,21 +14,28 @@ from app.language_manager import LanguageManager
 
 # 模块级缓存，供 farming_interface 获取图表文件列表
 _cached_charts: list[str] = []
+_cached_records: list[dict] = []
 
 
-def cache_charts(chart_files: list[str]):
-    global _cached_charts
+def cache_charts(chart_files: list[str], records: list[dict] | None = None):
+    global _cached_charts, _cached_records
     _cached_charts = list(chart_files)
+    if records is not None:
+        _cached_records = list(records)
 
 
 def get_cached_charts() -> list[str]:
     return _cached_charts
 
 
+def get_cached_records() -> list[dict]:
+    return _cached_records
+
+
 class MirrorStatsDialog(FramelessDialog):
     """镜牢统计图表查看器"""
 
-    def __init__(self, parent, chart_files: list[str]):
+    def __init__(self, parent, chart_files: list[str], all_records: list[dict] | None = None):
         super().__init__(parent)
         self.setObjectName("MirrorStatsDialog")
         LanguageManager().register_component(self)
@@ -42,7 +50,8 @@ class MirrorStatsDialog(FramelessDialog):
 
         self.chart_files = chart_files
         self._current_index = 0
-        self._image_labels: list[QLabel] = []
+        self._all_records = all_records or []
+        self._today_only = False
 
         self._init_ui()
         if chart_files:
@@ -66,10 +75,21 @@ class MirrorStatsDialog(FramelessDialog):
         self.content_layout.setContentsMargins(24, 24, 24, 24)
         self.content_layout.setSpacing(16)
 
-        # 标题
+        # 标题居中
         self.title_label = TitleLabel(self.tr("镜牢统计报告"), self.content)
         self.title_label.setAlignment(Qt.AlignCenter)
         self.content_layout.addWidget(self.title_label)
+
+        # 只看今日复选框（标题下方居右）
+        if self._all_records:
+            filter_layout = QHBoxLayout()
+            filter_layout.addStretch()
+            self.today_checkbox = CheckBox(self.tr("只看今日"), self.content)
+            self.today_checkbox.toggled.connect(self._on_today_toggled)
+            filter_layout.addWidget(self.today_checkbox)
+            self.content_layout.addLayout(filter_layout)
+        else:
+            self.today_checkbox = None
 
         # 图表切换提示
         self.nav_label = SubtitleLabel("", self.content)
@@ -94,6 +114,28 @@ class MirrorStatsDialog(FramelessDialog):
         self.scroll.setWidget(self.content)
         main_layout.addWidget(self.scroll)
 
+    def _on_today_toggled(self, checked: bool):
+        """切换只看今日"""
+        if not self._all_records:
+            return
+        self._today_only = checked
+        try:
+            from tasks.base.script_task_scheme import generate_mirror_charts
+            if checked:
+                today = datetime.now().strftime("%Y-%m-%d")
+                filtered = [r for r in self._all_records
+                            if r.get("timestamp", "").startswith(today)]
+                charts = generate_mirror_charts(filtered)
+                self.title_label.setText(self.tr(f"镜牢统计报告（今日 {len(filtered)} 轮）"))
+            else:
+                charts = generate_mirror_charts(self._all_records)
+                self.title_label.setText(self.tr(f"镜牢统计报告（共 {len(self._all_records)} 轮）"))
+            if charts:
+                self.chart_files = charts
+                self._show_chart(0)
+        except Exception:
+            pass
+
     def _show_chart(self, index: int):
         if index < 0 or index >= len(self.chart_files):
             return
@@ -109,7 +151,11 @@ class MirrorStatsDialog(FramelessDialog):
         """i18n 翻译回调（LanguageManager 要求）"""
         self.setWindowTitle(self.tr("镜牢统计数据"))
         if hasattr(self, 'title_label') and self.title_label:
-            self.title_label.setText(self.tr("镜牢统计报告"))
+            prefix = self.tr("镜牢统计报告")
+            if self._today_only:
+                self.title_label.setText(self.tr(f"{prefix}（今日）"))
+            else:
+                self.title_label.setText(prefix)
         if self.chart_files:
             self.nav_label.setText(self.tr(f"图表 {self._current_index + 1} / {len(self.chart_files)}  |  滚轮切换"))
 
